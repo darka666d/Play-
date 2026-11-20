@@ -1,0 +1,50 @@
+name: DigiForstep Windows Build
+
+on:
+  workflow_dispatch:
+
+env:
+  QT_VERSION: '5.15.2'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    - name: Apply DigiForstep patch
+      shell: bash
+      run: git apply --ignore-whitespace DigiForstep.patch
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v3
+    - name: Install OpenAL
+      uses: crazy-max/ghaction-chocolatey@v4
+      with:
+        args: install -y openal openalsdk
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: ${{ env.QT_VERSION }}
+        arch: win64_msvc2019_64
+        cache: true
+    - name: Configure
+      run: |
+        mkdir build
+        cd build
+        cmake .. -G "Visual Studio 17 2022" -A x64 -DUSE_QT=on
+    - name: Build
+      run: |
+        cd build
+        cmake --build . --config Release --target Play
+    - name: Deploy Qt DLLs
+      run: |
+        cd build
+        ${{ env.QT_ROOT_DIR }}\bin\windeployqt.exe ./Source/ui_qt/Release --no-system-d3d-compiler --no-quick-import --no-opengl-sw --no-compiler-runtime --no-translations
+    - name: Upload build
+      uses: actions/upload-artifact@v7
+      with:
+        name: DigiForstep-Windows
+        path: build/Source/ui_qt/Release
