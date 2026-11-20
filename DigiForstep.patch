@@ -1,0 +1,1247 @@
+diff --git a/Source/input/PH_GenericInput.cpp b/Source/input/PH_GenericInput.cpp
+index fac4f0e..56c64e6 100644
+--- a/Source/input/PH_GenericInput.cpp
++++ b/Source/input/PH_GenericInput.cpp
+@@ -1,5 +1,6 @@
+ #include "PH_GenericInput.h"
+ #include <array>
++#include <cstdlib>
+ #include <utility>
+ 
+ void CPH_GenericInput::Update(uint8* ram)
+@@ -10,13 +11,35 @@ void CPH_GenericInput::Update(uint8* ram)
+ 	{
+ 		for(unsigned int pad = 0; pad < CInputBindingManager::MAX_PADS; pad++)
+ 		{
++			REMOTEPAD remote;
++			{
++				std::lock_guard<std::mutex> lock(m_remoteMutex);
++				remote = m_remote[pad];
++			}
+ 			for(unsigned int buttonIdx = 0; buttonIdx < PS2::CControllerInfo::MAX_BUTTONS; buttonIdx++)
+ 			{
+ 				auto button = static_cast<PS2::CControllerInfo::BUTTON>(buttonIdx);
+ 				const auto& binding = m_bindingManager.GetBinding(pad, button);
+-				if(!binding) continue;
+-				uint32 value = binding->GetValue();
+-				if(PS2::CControllerInfo::IsAxis(button))
++				if(!binding && !remote.active) continue;
++				bool isAxis = PS2::CControllerInfo::IsAxis(button);
++				uint32 value = binding ? binding->GetValue() : (isAxis ? 0x80 : 0);
++				if(remote.active)
++				{
++					if(isAxis)
++					{
++						//Axis values are the first 4 entries of the BUTTON enum. Largest deflection wins.
++						uint32 remoteValue = remote.axes[buttonIdx];
++						if(std::abs(static_cast<int>(remoteValue) - 0x80) > std::abs(static_cast<int>(value & 0xFF) - 0x80))
++						{
++							value = remoteValue;
++						}
++					}
++					else if(remote.buttons & (1U << buttonIdx))
++					{
++						value = 1;
++					}
++				}
++				if(isAxis)
+ 				{
+ 					interface->SetAxisState(pad, button, value & 0xFF, ram);
+ 				}
+@@ -52,3 +75,37 @@ CPadHandler::FactoryFunction CPH_GenericInput::GetFactoryFunction()
+ {
+ 	return []() { return new CPH_GenericInput(); };
+ }
++
++void CPH_GenericInput::SetRemoteState(unsigned int pad, bool active, uint32 buttons, const uint8* axes)
++{
++	if(pad >= CInputBindingManager::MAX_PADS) return;
++	std::lock_guard<std::mutex> lock(m_remoteMutex);
++	auto& remote = m_remote[pad];
++	remote.active = active;
++	remote.buttons = active ? buttons : 0;
++	for(int i = 0; i < 4; i++)
++	{
++		remote.axes[i] = (active && axes) ? axes[i] : 0x80;
++	}
++}
++
++void CPH_GenericInput::GetLocalState(unsigned int pad, uint32& buttons, uint8* axes)
++{
++	buttons = 0;
++	for(int i = 0; i < 4; i++) axes[i] = 0x80;
++	for(unsigned int buttonIdx = 0; buttonIdx < PS2::CControllerInfo::MAX_BUTTONS; buttonIdx++)
++	{
++		auto button = static_cast<PS2::CControllerInfo::BUTTON>(buttonIdx);
++		const auto& binding = m_bindingManager.GetBinding(pad, button);
++		if(!binding) continue;
++		uint32 value = binding->GetValue();
++		if(PS2::CControllerInfo::IsAxis(button))
++		{
++			axes[buttonIdx] = static_cast<uint8>(value & 0xFF);
++		}
++		else if(value != 0)
++		{
++			buttons |= (1U << buttonIdx);
++		}
++	}
++}
+diff --git a/Source/input/PH_GenericInput.h b/Source/input/PH_GenericInput.h
+index 64d9c6a..7865098 100644
+--- a/Source/input/PH_GenericInput.h
++++ b/Source/input/PH_GenericInput.h
+@@ -2,6 +2,8 @@
+ 
+ #include "PadHandler.h"
+ #include "InputBindingManager.h"
++#include <array>
++#include <mutex>
+ 
+ class CPH_GenericInput : public CPadHandler
+ {
+@@ -13,8 +15,22 @@ public:
+ 
+ 	CInputBindingManager& GetBindingManager();
+ 
++	//Online play: state coming from remote guests, merged on top of the local bindings.
++	//Button bit n corresponds to PS2::CControllerInfo::BUTTON n. Axes are LX, LY, RX, RY (0x80 = centered).
++	void SetRemoteState(unsigned int pad, bool active, uint32 buttons, const uint8* axes);
++	void GetLocalState(unsigned int pad, uint32& buttons, uint8* axes);
++
+ 	static FactoryFunction GetFactoryFunction();
+ 
+ private:
++	struct REMOTEPAD
++	{
++		bool active = false;
++		uint32 buttons = 0;
++		uint8 axes[4] = {0x80, 0x80, 0x80, 0x80};
++	};
++
+ 	CInputBindingManager m_bindingManager;
++	std::mutex m_remoteMutex;
++	std::array<REMOTEPAD, CInputBindingManager::MAX_PADS> m_remote;
+ };
+diff --git a/Source/ui_qt/AudioShare.h b/Source/ui_qt/AudioShare.h
+new file mode 100644
+index 0000000..2360971
+--- /dev/null
++++ b/Source/ui_qt/AudioShare.h
+@@ -0,0 +1,71 @@
++#pragma once
++
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <vector>
++#include "sound/SoundHandler.h"
++
++// Receives a copy of every audio block the emulator plays, while the online host has guests.
++class CAudioShare
++{
++public:
++	using Handler = std::function<void(const int16*, unsigned int, unsigned int)>;
++
++	static CAudioShare& GetInstance()
++	{
++		static CAudioShare instance;
++		return instance;
++	}
++
++	void Enable(Handler handler)
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		m_handler = std::move(handler);
++	}
++
++	void Disable()
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		m_handler = nullptr;
++	}
++
++	void Submit(const int16* samples, unsigned int count, unsigned int rate)
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		if(m_handler) m_handler(samples, count, rate);
++	}
++
++private:
++	std::mutex m_mutex;
++	Handler m_handler;
++};
++
++// Wraps the real sound handler: plays normally and also feeds CAudioShare.
++class CSH_AudioTap : public CSoundHandler
++{
++public:
++	CSH_AudioTap(std::unique_ptr<CSoundHandler> inner)
++	    : m_inner(std::move(inner))
++	{
++	}
++
++	static FactoryFunction Wrap(FactoryFunction innerFactory)
++	{
++		return [innerFactory]() -> CSoundHandler* {
++			return new CSH_AudioTap(std::unique_ptr<CSoundHandler>(innerFactory()));
++		};
++	}
++
++	void Reset() override { m_inner->Reset(); }
++	bool HasFreeBuffers() override { return m_inner->HasFreeBuffers(); }
++	void RecycleBuffers() override { m_inner->RecycleBuffers(); }
++	void Write(int16* samples, unsigned int count, unsigned int rate) override
++	{
++		CAudioShare::GetInstance().Submit(samples, count, rate);
++		m_inner->Write(samples, count, rate);
++	}
++
++private:
++	std::unique_ptr<CSoundHandler> m_inner;
++};
+diff --git a/Source/ui_qt/CMakeLists.txt b/Source/ui_qt/CMakeLists.txt
+index ce76ed4..5a2d95e 100644
+--- a/Source/ui_qt/CMakeLists.txt
++++ b/Source/ui_qt/CMakeLists.txt
+@@ -115,6 +115,10 @@ set(QT_SOURCES
+ 	main.cpp
+ 	mainwindow.cpp
+ 	mainwindow.h
++	onlineplay.cpp
++	onlineplay.h
++	FrameShare.h
++	AudioShare.h
+ 	ContinuationChecker.cpp
+ 	ContinuationChecker.h
+ 	ElidedLabel.cpp
+@@ -212,6 +216,7 @@ if(DEBUGGER_INCLUDED)
+ endif()
+ 	
+ set(QT_MOC_HEADERS
++	onlineplay.h
+ 	BootableModel.h
+ 	BootableModelProxy.h
+ 	ControllerConfig/controllerconfigdialog.h
+@@ -250,7 +255,7 @@ set(QT_RESOURCES
+ 	Qt_ui/resources.qrc
+ )
+ 
+-set(QT_COMPONENTS Widgets Core)
++set(QT_COMPONENTS Widgets Core Network)
+ 
+ find_package(Qt6 COMPONENTS ${QT_COMPONENTS})
+ if(NOT Qt6_FOUND)
+@@ -261,7 +266,7 @@ if(NOT Qt6_FOUND)
+ 	find_package(Qt5 REQUIRED COMPONENTS ${QT_COMPONENTS})
+ endif()
+ 
+-list(APPEND UI_QT_PROJECT_LIBS Qt::Widgets Qt::Core)
++list(APPEND UI_QT_PROJECT_LIBS Qt::Widgets Qt::Core Qt::Network)
+ if(TARGET_PLATFORM_UNIX AND Qt5_FOUND)
+ 	list(APPEND UI_QT_PROJECT_LIBS Qt::X11Extras)
+ endif()
+@@ -360,6 +365,7 @@ else()
+ endif()
+ 
+ target_link_libraries(Play ${UI_QT_PROJECT_LIBS})
++set_target_properties(Play PROPERTIES OUTPUT_NAME DigiForstep)
+ target_compile_definitions(Play PRIVATE ${UI_QT_DEFINITIONS_LIST})
+ 
+ target_include_directories(Play PRIVATE
+diff --git a/Source/ui_qt/FrameShare.h b/Source/ui_qt/FrameShare.h
+new file mode 100644
+index 0000000..5cbfba6
+--- /dev/null
++++ b/Source/ui_qt/FrameShare.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include <QImage>
++#include <atomic>
++#include <chrono>
++#include <functional>
++#include <mutex>
++
++// Bridge between the GS thread (which owns the OpenGL back buffer) and the online host.
++// The GS thread asks ShouldCapture() once per presented frame and, if true, reads back the
++// back buffer and calls Submit(). Capture is off unless a guest is connected.
++class CFrameShare
++{
++public:
++	using Handler = std::function<void(QImage)>;
++
++	static CFrameShare& GetInstance()
++	{
++		static CFrameShare instance;
++		return instance;
++	}
++
++	void Enable(Handler handler)
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		m_handler = std::move(handler);
++		m_enabled = true;
++	}
++
++	void Disable()
++	{
++		m_enabled = false;
++		std::lock_guard<std::mutex> lock(m_mutex);
++		m_handler = nullptr;
++	}
++
++	// Called from the GS thread only. Caps capture at ~25 fps.
++	bool ShouldCapture()
++	{
++		if(!m_enabled) return false;
++		auto now = std::chrono::steady_clock::now();
++		if(now - m_lastCapture < std::chrono::milliseconds(40)) return false;
++		m_lastCapture = now;
++		return true;
++	}
++
++	void Submit(QImage image)
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		if(m_handler) m_handler(std::move(image));
++	}
++
++private:
++	std::atomic<bool> m_enabled{false};
++	std::mutex m_mutex;
++	Handler m_handler;
++	std::chrono::steady_clock::time_point m_lastCapture;
++};
+diff --git a/Source/ui_qt/GSH_OpenGLQt.cpp b/Source/ui_qt/GSH_OpenGLQt.cpp
+index 2d7f088..e6e2aef 100644
+--- a/Source/ui_qt/GSH_OpenGLQt.cpp
++++ b/Source/ui_qt/GSH_OpenGLQt.cpp
+@@ -2,6 +2,8 @@
+ #include "GSH_OpenGLQt.h"
+ #endif
+ 
++#include "FrameShare.h"
++
+ #include <QSurface>
+ #include <QWindow>
+ #include <QOpenGLContext>
+@@ -67,6 +69,22 @@ void CGSH_OpenGLQt::PresentBackbuffer()
+ 
+ 	if(swapBuffer)
+ 	{
++		//DigiForstep: grab the finished frame for online guests (only when someone is connected)
++		auto& frameShare = CFrameShare::GetInstance();
++		if(m_renderSurface->surfaceClass() == QSurface::Window && frameShare.ShouldCapture())
++		{
++			auto window = static_cast<QWindow*>(m_renderSurface);
++			int width = static_cast<int>(window->width() * window->devicePixelRatio());
++			int height = static_cast<int>(window->height() * window->devicePixelRatio());
++			if(width > 0 && height > 0)
++			{
++				QImage image(width, height, QImage::Format_RGBX8888);
++				glPixelStorei(GL_PACK_ALIGNMENT, 4);
++				glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, image.bits());
++				frameShare.Submit(std::move(image)); //bottom-up image, flipped by the encoder thread
++			}
++		}
++
+ 		m_context->swapBuffers(m_renderSurface);
+ 		m_context->makeCurrent(m_renderSurface);
+ 	}
+diff --git a/Source/ui_qt/Qt_ui/mainwindow.ui b/Source/ui_qt/Qt_ui/mainwindow.ui
+index ec32df6..4e2884b 100644
+--- a/Source/ui_qt/Qt_ui/mainwindow.ui
++++ b/Source/ui_qt/Qt_ui/mainwindow.ui
+@@ -14,7 +14,7 @@
+    <enum>Qt::ClickFocus</enum>
+   </property>
+   <property name="windowTitle">
+-   <string>Play!</string>
++   <string>DigiForstep</string>
+   </property>
+   <property name="windowIcon">
+    <iconset resource="resources.qrc">
+diff --git a/Source/ui_qt/main.cpp b/Source/ui_qt/main.cpp
+index eb66381..2b2b5de 100644
+--- a/Source/ui_qt/main.cpp
++++ b/Source/ui_qt/main.cpp
+@@ -14,7 +14,7 @@ int main(int argc, char* argv[])
+ #endif
+ 	QApplication a(argc, argv);
+ 
+-	QCoreApplication::setApplicationName("Play!");
++	QCoreApplication::setApplicationName("DigiForstep");
+ 	QCoreApplication::setApplicationVersion("Version: " PLAY_VERSION);
+ 
+ 	qRegisterMetaType<std::string>();
+diff --git a/Source/ui_qt/mainwindow.cpp b/Source/ui_qt/mainwindow.cpp
+index 47ece7a..34355dc 100644
+--- a/Source/ui_qt/mainwindow.cpp
++++ b/Source/ui_qt/mainwindow.cpp
+@@ -30,6 +30,8 @@
+ #include <QtGlobal>
+ #include <QCheckBox>
+ #include <QShortcut>
++#include <QInputDialog>
++#include "AudioShare.h"
+ 
+ #include "StdStreamUtils.h"
+ #include "string_format.h"
+@@ -126,6 +128,7 @@ MainWindow::MainWindow(QWidget* parent)
+ 	InitVirtualMachine();
+ 	SetupGsHandler();
+ 	SetupDebugger();
++	SetupOnlineMenu();
+ 
+ 	m_onRunningStateChangeConnection = m_virtualMachine->OnRunningStateChange.Connect([&] {
+ 		if(m_virtualMachine->GetStatus() == CVirtualMachine::RUNNING)
+@@ -140,6 +143,7 @@ MainWindow::~MainWindow()
+ 	m_frameDebugger.reset();
+ #endif
+ 	CAppConfig::GetInstance().Save();
++	if(m_onlineHost) m_onlineHost->Stop();
+ 	if(m_virtualMachine != nullptr)
+ 	{
+ 		m_virtualMachine->Pause();
+@@ -268,9 +272,9 @@ void MainWindow::SetupSoundHandler()
+ 		try
+ 		{
+ #ifdef _WIN32
+-			m_virtualMachine->CreateSoundHandler(&CSH_WaveOut::HandlerFactory);
++			m_virtualMachine->CreateSoundHandler(CSH_AudioTap::Wrap(&CSH_WaveOut::HandlerFactory));
+ #else
+-			m_virtualMachine->CreateSoundHandler(&CSH_OpenAL::HandlerFactory);
++			m_virtualMachine->CreateSoundHandler(CSH_AudioTap::Wrap(&CSH_OpenAL::HandlerFactory));
+ #endif
+ 		}
+ 		catch(const std::exception& ex)
+@@ -581,7 +585,7 @@ void MainWindow::CreateStatusBar()
+ 		statusBar()->addWidget(m_gsLabel);
+ 	}
+ #endif
+-	m_msgLabel->setText(QString("Play! v%1 - %2").arg(PLAY_VERSION).arg(__DATE__));
++	m_msgLabel->setText(QString("DigiForstep v%1 - %2").arg(PLAY_VERSION).arg(__DATE__));
+ 
+ 	m_fpsTimer = new QTimer(this);
+ 	connect(m_fpsTimer, SIGNAL(timeout()), this, SLOT(updateStats()));
+@@ -839,7 +843,7 @@ void MainWindow::EmitOnExecutableChange()
+ void MainWindow::HandleOnExecutableChange()
+ {
+ 	UpdateUI();
+-	auto titleString = QString("Play! - [ %1 ] - %2").arg(m_virtualMachine->m_ee->m_os->GetExecutableName(), QString(PLAY_VERSION));
++	auto titleString = QString("DigiForstep - [ %1 ] - %2").arg(m_virtualMachine->m_ee->m_os->GetExecutableName(), QString(PLAY_VERSION));
+ 	setWindowTitle(titleString);
+ 	ui->bootablesView->AsyncResetModel(true);
+ }
+@@ -1271,3 +1275,43 @@ void MainWindow::SetupDebugger()
+ 
+ #endif //DEBUGGER_INCLUDED
+ }
++
++void MainWindow::SetupOnlineMenu()
++{
++	PadHandlerGetter padHandlerGetter = [this]() -> CPH_GenericInput* {
++		return m_virtualMachine ? static_cast<CPH_GenericInput*>(m_virtualMachine->GetPadHandler()) : nullptr;
++	};
++	m_onlineHost = new COnlineHost(this);
++	m_onlineHost->SetPadHandlerGetter(padHandlerGetter);
++
++	auto* menu = menuBar()->addMenu(tr("Online"));
++	connect(menu->addAction(tr("Host Session...")), &QAction::triggered, this, [this]() {
++		if(!m_onlineHostDialog) m_onlineHostDialog = new COnlineHostDialog(m_onlineHost, this);
++		m_onlineHostDialog->show();
++		m_onlineHostDialog->raise();
++	});
++	connect(menu->addAction(tr("Join Session...")), &QAction::triggered, this, [this]() { JoinOnlineSession(); });
++}
++
++void MainWindow::JoinOnlineSession()
++{
++	bool ok = false;
++	auto text = QInputDialog::getText(this, tr("Join Session"), tr("Host address (IP or IP:port):"), QLineEdit::Normal, m_lastJoinAddress, &ok).trimmed();
++	if(!ok || text.isEmpty()) return;
++	m_lastJoinAddress = text;
++
++	QString host = text;
++	quint16 port = OnlineProto::DEFAULT_PORT;
++	int colon = text.lastIndexOf(':');
++	if(colon > 0)
++	{
++		host = text.left(colon);
++		port = static_cast<quint16>(text.mid(colon + 1).toUInt());
++	}
++
++	PadHandlerGetter padHandlerGetter = [this]() -> CPH_GenericInput* {
++		return m_virtualMachine ? static_cast<CPH_GenericInput*>(m_virtualMachine->GetPadHandler()) : nullptr;
++	};
++	auto* window = new COnlineGuestWindow(host, port, padHandlerGetter, m_qtKeyInputProvider, this);
++	window->show();
++}
+diff --git a/Source/ui_qt/mainwindow.h b/Source/ui_qt/mainwindow.h
+index a2710e6..7fca0ea 100644
+--- a/Source/ui_qt/mainwindow.h
++++ b/Source/ui_qt/mainwindow.h
+@@ -14,6 +14,7 @@
+ #include "InputProviderQtKey.h"
+ #include "InputProviderQtMouse.h"
+ #include "ScreenShotUtils.h"
++#include "onlineplay.h"
+ 
+ namespace Ui
+ {
+@@ -94,6 +95,8 @@ private:
+ 	void UpdateGSHandlerLabel();
+ 	void SetupBootableView();
+ 	void SetupDebugger();
++	void SetupOnlineMenu();
++	void JoinOnlineSession();
+ 
+ 	Ui::MainWindow* ui = nullptr;
+ 
+@@ -112,6 +115,9 @@ private:
+ 	bool m_deactivatePause = false;
+ 	bool m_pauseFocusLost = true;
+ 	std::shared_ptr<CInputProviderQtKey> m_qtKeyInputProvider;
++	COnlineHost* m_onlineHost = nullptr;
++	COnlineHostDialog* m_onlineHostDialog = nullptr;
++	QString m_lastJoinAddress;
+ 	std::shared_ptr<CInputProviderQtMouse> m_qtMouseInputProvider;
+ 	LastOpenCommand m_lastOpenCommand;
+ 	fs::path m_lastPath;
+diff --git a/Source/ui_qt/onlineplay.cpp b/Source/ui_qt/onlineplay.cpp
+new file mode 100644
+index 0000000..e68e349
+--- /dev/null
++++ b/Source/ui_qt/onlineplay.cpp
+@@ -0,0 +1,571 @@
++#include "onlineplay.h"
++#include "FrameShare.h"
++#include "AudioShare.h"
++#ifdef _WIN32
++#include "sound/SH_WaveOut/SH_WaveOut.h"
++#else
++#include "sound/SH_OpenAL/SH_OpenAL.h"
++#endif
++
++#include <QBuffer>
++#include <QComboBox>
++#include <QHBoxLayout>
++#include <QHostAddress>
++#include <QKeyEvent>
++#include <QLabel>
++#include <QNetworkInterface>
++#include <QPainter>
++#include <QPushButton>
++#include <QSpinBox>
++#include <QVBoxLayout>
++#include <QtEndian>
++#include <cstdlib>
++#include <cstring>
++
++using namespace OnlineProto;
++
++QByteArray OnlineProto::Pack(MsgType type, const QByteArray& payload)
++{
++	char header[4];
++	qToLittleEndian<quint32>(static_cast<quint32>(payload.size() + 1), header);
++	QByteArray result;
++	result.reserve(5 + payload.size());
++	result.append(header, 4);
++	result.append(static_cast<char>(type));
++	result.append(payload);
++	return result;
++}
++
++bool OnlineProto::Unpack(QByteArray& buffer, const std::function<void(quint8, const QByteArray&)>& handler)
++{
++	int offset = 0;
++	bool ok = true;
++	while(buffer.size() - offset >= 4)
++	{
++		quint32 length = qFromLittleEndian<quint32>(buffer.constData() + offset);
++		if(length == 0 || length > 4 * 1024 * 1024)
++		{
++			ok = false;
++			break;
++		}
++		if(static_cast<quint32>(buffer.size() - offset - 4) < length) break;
++		quint8 type = static_cast<quint8>(buffer[offset + 4]);
++		handler(type, buffer.mid(offset + 5, length - 1));
++		offset += 4 + length;
++	}
++	if(ok)
++		buffer.remove(0, offset);
++	else
++		buffer.clear();
++	return ok;
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////
++// Host
++//////////////////////////////////////////////////////////////////////////////////////////
++
++COnlineHost::COnlineHost(QObject* parent)
++    : QObject(parent)
++{
++	connect(&m_server, &QTcpServer::newConnection, this, &COnlineHost::OnNewConnection);
++}
++
++COnlineHost::~COnlineHost()
++{
++	Stop();
++}
++
++void COnlineHost::SetPadHandlerGetter(PadHandlerGetter getter)
++{
++	m_padHandlerGetter = std::move(getter);
++}
++
++bool COnlineHost::IsRunning() const
++{
++	return m_server.isListening();
++}
++
++QString COnlineHost::ErrorString() const
++{
++	return m_server.errorString();
++}
++
++bool COnlineHost::Start(quint16 port)
++{
++	if(IsRunning()) return true;
++	if(!m_server.listen(QHostAddress::AnyIPv4, port)) return false;
++
++	m_encoderQuit = false;
++	m_encoderThread = std::thread([this] { EncoderLoop(); });
++	UpdateCapture();
++	return true;
++}
++
++void COnlineHost::Stop()
++{
++	m_server.close();
++	for(auto& guest : m_guests)
++	{
++		if(guest.socket)
++		{
++			auto* socket = guest.socket;
++			guest = Guest();
++			socket->disconnect(this);
++			socket->abort();
++			socket->deleteLater();
++		}
++	}
++	CFrameShare::GetInstance().Disable();
++	CAudioShare::GetInstance().Disable();
++	if(m_encoderThread.joinable())
++	{
++		{
++			std::lock_guard<std::mutex> lock(m_encoderMutex);
++			m_encoderQuit = true;
++		}
++		m_encoderCv.notify_all();
++		m_encoderThread.join();
++	}
++	PushState();
++	emit guestsChanged();
++}
++
++COnlineHost::GuestInfo COnlineHost::GetGuest(int slot) const
++{
++	GuestInfo info;
++	if(slot < 0 || slot >= MAX_GUESTS || !m_guests[slot].socket) return info;
++	info.connected = true;
++	info.address = m_guests[slot].socket->peerAddress().toString();
++	info.pad = m_guests[slot].pad;
++	return info;
++}
++
++void COnlineHost::SetGuestPad(int slot, int pad)
++{
++	if(slot < 0 || slot >= MAX_GUESTS || pad < 0 || pad >= CInputBindingManager::MAX_PADS) return;
++	m_guests[slot].pad = pad;
++	SendWelcome(slot);
++	PushState();
++}
++
++int COnlineHost::GuestCount() const
++{
++	int count = 0;
++	for(const auto& guest : m_guests)
++		if(guest.socket) count++;
++	return count;
++}
++
++void COnlineHost::OnNewConnection()
++{
++	while(m_server.hasPendingConnections())
++	{
++		auto* socket = m_server.nextPendingConnection();
++		int slot = -1;
++		for(int i = 0; i < MAX_GUESTS; i++)
++		{
++			if(!m_guests[i].socket)
++			{
++				slot = i;
++				break;
++			}
++		}
++		if(slot < 0)
++		{
++			QByteArray full;
++			full.append(static_cast<char>(0xFF));
++			full.append(static_cast<char>(0));
++			socket->write(Pack(MSG_WELCOME, full));
++			socket->flush();
++			socket->disconnectFromHost();
++			connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
++			continue;
++		}
++		socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
++		m_guests[slot] = Guest();
++		m_guests[slot].socket = socket;
++		connect(socket, &QTcpSocket::readyRead, this, [this, slot, socket] { OnGuestData(slot, socket); });
++		connect(socket, &QTcpSocket::disconnected, this, [this, slot, socket] { OnGuestDisconnected(slot, socket); });
++		SendWelcome(slot);
++		UpdateCapture();
++		emit guestsChanged();
++	}
++}
++
++void COnlineHost::SendWelcome(int slot)
++{
++	auto* socket = m_guests[slot].socket;
++	if(!socket) return;
++	QByteArray payload;
++	payload.append(static_cast<char>(slot));
++	payload.append(static_cast<char>(m_guests[slot].pad));
++	socket->write(Pack(MSG_WELCOME, payload));
++}
++
++void COnlineHost::OnGuestData(int slot, QTcpSocket* socket)
++{
++	auto& guest = m_guests[slot];
++	if(guest.socket != socket) return;
++	guest.rx.append(socket->readAll());
++	bool ok = Unpack(guest.rx, [&](quint8 type, const QByteArray& payload) {
++		if(type == MSG_INPUT && payload.size() == 8)
++		{
++			guest.buttons = qFromLittleEndian<quint32>(payload.constData());
++			memcpy(guest.axes, payload.constData() + 4, 4);
++		}
++	});
++	if(!ok)
++	{
++		socket->abort();
++		return;
++	}
++	PushState();
++}
++
++void COnlineHost::OnGuestDisconnected(int slot, QTcpSocket* socket)
++{
++	if(m_guests[slot].socket != socket) return;
++	m_guests[slot] = Guest();
++	socket->deleteLater();
++	PushState();
++	UpdateCapture();
++	emit guestsChanged();
++}
++
++// Merge every guest that controls a given pad into one remote state for that pad.
++void COnlineHost::PushState()
++{
++	auto* padHandler = m_padHandlerGetter ? m_padHandlerGetter() : nullptr;
++	if(!padHandler) return;
++	for(int pad = 0; pad < CInputBindingManager::MAX_PADS; pad++)
++	{
++		bool active = false;
++		quint32 buttons = 0;
++		uint8 axes[4] = {0x80, 0x80, 0x80, 0x80};
++		for(const auto& guest : m_guests)
++		{
++			if(!guest.socket || guest.pad != pad) continue;
++			active = true;
++			buttons |= guest.buttons;
++			for(int i = 0; i < 4; i++)
++			{
++				if(std::abs(int(guest.axes[i]) - 0x80) > std::abs(int(axes[i]) - 0x80))
++					axes[i] = guest.axes[i];
++			}
++		}
++		padHandler->SetRemoteState(pad, active, buttons, axes);
++	}
++}
++
++void COnlineHost::UpdateCapture()
++{
++	if(IsRunning() && GuestCount() > 0)
++	{
++		CFrameShare::GetInstance().Enable([this](QImage image) {
++			{
++				std::lock_guard<std::mutex> lock(m_encoderMutex);
++				m_pendingImage = std::move(image); // keep only the newest frame
++			}
++			m_encoderCv.notify_one();
++		});
++	}
++	else
++	{
++		CFrameShare::GetInstance().Disable();
++	}
++
++	if(IsRunning() && GuestCount() > 0)
++	{
++		CAudioShare::GetInstance().Enable([this](const int16* samples, unsigned int count, unsigned int rate) {
++			QByteArray payload(4 + count * sizeof(int16), 0);
++			qToLittleEndian<quint32>(rate, payload.data());
++			memcpy(payload.data() + 4, samples, count * sizeof(int16));
++			QMetaObject::invokeMethod(this, [this, payload] { BroadcastAudio(payload); }, Qt::QueuedConnection);
++		});
++	}
++	else
++	{
++		CAudioShare::GetInstance().Disable();
++	}
++}
++
++void COnlineHost::BroadcastAudio(const QByteArray& payload)
++{
++	auto message = Pack(MSG_AUDIO, payload);
++	for(auto& guest : m_guests)
++	{
++		if(guest.socket && guest.socket->bytesToWrite() < (2 << 20))
++			guest.socket->write(message);
++	}
++}
++
++void COnlineHost::EncoderLoop()
++{
++	while(true)
++	{
++		QImage image;
++		{
++			std::unique_lock<std::mutex> lock(m_encoderMutex);
++			m_encoderCv.wait(lock, [this] { return m_encoderQuit || !m_pendingImage.isNull(); });
++			if(m_encoderQuit) return;
++			image = std::move(m_pendingImage);
++			m_pendingImage = QImage();
++		}
++		image = image.mirrored(false, true); // GL read-back is bottom-up
++		if(image.width() > 640) image = image.scaledToWidth(640, Qt::FastTransformation);
++		QByteArray jpeg;
++		QBuffer buffer(&jpeg);
++		buffer.open(QIODevice::WriteOnly);
++		image.save(&buffer, "JPEG", 65);
++		QMetaObject::invokeMethod(this, [this, jpeg] { BroadcastFrame(jpeg); }, Qt::QueuedConnection);
++	}
++}
++
++void COnlineHost::BroadcastFrame(const QByteArray& jpeg)
++{
++	if(jpeg.isEmpty()) return;
++	auto message = Pack(MSG_FRAME, jpeg);
++	for(auto& guest : m_guests)
++	{
++		//Drop the frame for slow guests instead of building up latency
++		if(guest.socket && guest.socket->bytesToWrite() < (1 << 20))
++			guest.socket->write(message);
++	}
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////
++// Host dialog
++//////////////////////////////////////////////////////////////////////////////////////////
++
++COnlineHostDialog::COnlineHostDialog(COnlineHost* host, QWidget* parent)
++    : QDialog(parent)
++    , m_host(host)
++{
++	setWindowTitle(tr("DigiForstep - Host Session"));
++	auto* layout = new QVBoxLayout(this);
++
++	auto* portRow = new QHBoxLayout();
++	portRow->addWidget(new QLabel(tr("Port:"), this));
++	m_port = new QSpinBox(this);
++	m_port->setRange(1024, 65535);
++	m_port->setValue(DEFAULT_PORT);
++	portRow->addWidget(m_port);
++	m_toggle = new QPushButton(tr("Start hosting"), this);
++	portRow->addWidget(m_toggle);
++	layout->addLayout(portRow);
++
++	m_status = new QLabel(this);
++	layout->addWidget(m_status);
++	m_addresses = new QLabel(this);
++	m_addresses->setTextInteractionFlags(Qt::TextSelectableByMouse);
++	m_addresses->setWordWrap(true);
++	layout->addWidget(m_addresses);
++
++	for(int i = 0; i < MAX_GUESTS; i++)
++	{
++		auto* row = new QHBoxLayout();
++		m_guestLabels[i] = new QLabel(this);
++		m_guestPads[i] = new QComboBox(this);
++		for(int pad = 1; pad <= CInputBindingManager::MAX_PADS; pad++)
++			m_guestPads[i]->addItem(tr("Controls pad %1").arg(pad));
++		row->addWidget(m_guestLabels[i], 1);
++		row->addWidget(m_guestPads[i]);
++		layout->addLayout(row);
++		connect(m_guestPads[i], QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, i](int index) {
++			m_host->SetGuestPad(i, index);
++		});
++	}
++
++	connect(m_toggle, &QPushButton::clicked, this, &COnlineHostDialog::ToggleServer);
++	connect(m_host, &COnlineHost::guestsChanged, this, &COnlineHostDialog::Refresh);
++	Refresh();
++}
++
++void COnlineHostDialog::ToggleServer()
++{
++	if(m_host->IsRunning())
++		m_host->Stop();
++	else if(!m_host->Start(static_cast<quint16>(m_port->value())))
++		m_status->setText(tr("Could not start: %1").arg(m_host->ErrorString()));
++	Refresh();
++}
++
++void COnlineHostDialog::Refresh()
++{
++	bool running = m_host->IsRunning();
++	m_toggle->setText(running ? tr("Stop hosting") : tr("Start hosting"));
++	m_port->setEnabled(!running);
++	if(running)
++	{
++		m_status->setText(tr("Hosting. Guests see your game screen and share your controller."));
++		QStringList addresses;
++		for(const auto& address : QNetworkInterface::allAddresses())
++		{
++			if(address.protocol() == QAbstractSocket::IPv4Protocol && !address.isLoopback())
++				addresses << address.toString();
++		}
++		m_addresses->setText(tr("Give your friends one of these addresses (the Radmin VPN one): %1").arg(addresses.join(", ")));
++	}
++	else if(!m_status->text().startsWith(tr("Could not")))
++	{
++		m_status->setText(tr("Not hosting."));
++		m_addresses->clear();
++	}
++	for(int i = 0; i < MAX_GUESTS; i++)
++	{
++		auto info = m_host->GetGuest(i);
++		m_guestLabels[i]->setText(info.connected ? tr("Guest %1: %2").arg(i + 1).arg(info.address) : tr("Guest %1: (empty)").arg(i + 1));
++		m_guestPads[i]->setEnabled(info.connected);
++		QSignalBlocker blocker(m_guestPads[i]);
++		m_guestPads[i]->setCurrentIndex(info.pad);
++	}
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////
++// Guest window
++//////////////////////////////////////////////////////////////////////////////////////////
++
++COnlineGuestWindow::COnlineGuestWindow(const QString& host, quint16 port, PadHandlerGetter getter, std::shared_ptr<CInputProviderQtKey> keyProvider, QWidget* parent)
++    : QWidget(parent, Qt::Window)
++    , m_padHandlerGetter(std::move(getter))
++    , m_keyProvider(std::move(keyProvider))
++    , m_host(host)
++{
++	setAttribute(Qt::WA_DeleteOnClose);
++	setFocusPolicy(Qt::StrongFocus);
++	resize(640, 480);
++	setWindowTitle(tr("DigiForstep - Guest"));
++	m_status = tr("Connecting to %1:%2 ...").arg(host).arg(port);
++
++	connect(&m_socket, &QTcpSocket::readyRead, this, &COnlineGuestWindow::OnReadyRead);
++	connect(&m_socket, &QTcpSocket::disconnected, this, &COnlineGuestWindow::OnDisconnected);
++	auto onError = [this](QAbstractSocket::SocketError) {
++		m_status = tr("Connection failed: %1").arg(m_socket.errorString());
++		update();
++	};
++#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
++	connect(&m_socket, &QAbstractSocket::errorOccurred, this, onError);
++#else
++	connect(&m_socket, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error), this, onError);
++#endif
++	connect(&m_inputTimer, &QTimer::timeout, this, &COnlineGuestWindow::SendInput);
++
++	try
++	{
++#ifdef _WIN32
++		m_sound.reset(CSH_WaveOut::HandlerFactory());
++#else
++		m_sound.reset(CSH_OpenAL::HandlerFactory());
++#endif
++	}
++	catch(const std::exception&)
++	{
++		m_sound.reset(); //no audio device: video/input still work
++	}
++
++	m_socket.setSocketOption(QAbstractSocket::LowDelayOption, 1);
++	m_socket.connectToHost(host, port);
++	m_inputTimer.start(8);
++}
++
++void COnlineGuestWindow::OnReadyRead()
++{
++	m_rx.append(m_socket.readAll());
++	bool ok = Unpack(m_rx, [this](quint8 type, const QByteArray& payload) {
++		if(type == MSG_WELCOME && payload.size() >= 2)
++		{
++			if(static_cast<quint8>(payload[0]) == 0xFF)
++			{
++				m_status = tr("The session is full (4 players max).");
++				return;
++			}
++			m_welcomed = true;
++			m_lastButtons = 0xFFFFFFFF; // force an input send
++			setWindowTitle(tr("DigiForstep - Guest %1 (controlling pad %2) - %3")
++			                   .arg(static_cast<quint8>(payload[0]) + 1)
++			                   .arg(static_cast<quint8>(payload[1]) + 1)
++			                   .arg(m_host));
++			m_status = tr("Connected. Waiting for the host to start a game...");
++		}
++		else if(type == MSG_AUDIO && m_sound && payload.size() > 4)
++		{
++			quint32 rate = qFromLittleEndian<quint32>(payload.constData());
++			unsigned int count = (payload.size() - 4) / sizeof(int16);
++			m_sound->RecycleBuffers();
++			if(m_sound->HasFreeBuffers()) //otherwise drop, keeps latency bounded
++			{
++				QByteArray copy = payload.mid(4); //Write() needs a mutable, aligned buffer
++				m_sound->Write(reinterpret_cast<int16*>(copy.data()), count, rate);
++			}
++		}
++		else if(type == MSG_FRAME)
++		{
++			QImage image = QImage::fromData(payload, "JPEG");
++			if(!image.isNull())
++			{
++				m_frame = std::move(image);
++				update();
++			}
++		}
++	});
++	if(!ok) m_socket.abort();
++}
++
++void COnlineGuestWindow::OnDisconnected()
++{
++	m_welcomed = false;
++	m_status = tr("Disconnected from the host.");
++	update();
++}
++
++void COnlineGuestWindow::SendInput()
++{
++	if(!m_welcomed || m_socket.state() != QAbstractSocket::ConnectedState) return;
++	auto* padHandler = m_padHandlerGetter ? m_padHandlerGetter() : nullptr;
++	if(!padHandler) return;
++
++	quint32 buttons = 0;
++	uint8 axes[4] = {};
++	padHandler->GetLocalState(0, buttons, axes);
++	if(buttons == m_lastButtons && memcmp(axes, m_lastAxes, 4) == 0) return;
++	m_lastButtons = buttons;
++	memcpy(m_lastAxes, axes, 4);
++
++	QByteArray payload(8, 0);
++	qToLittleEndian<quint32>(buttons, payload.data());
++	memcpy(payload.data() + 4, axes, 4);
++	m_socket.write(Pack(MSG_INPUT, payload));
++}
++
++void COnlineGuestWindow::paintEvent(QPaintEvent*)
++{
++	QPainter painter(this);
++	painter.fillRect(rect(), Qt::black);
++	if(!m_frame.isNull() && m_welcomed)
++	{
++		QSize size = m_frame.size().scaled(this->size(), Qt::KeepAspectRatio);
++		QRect target(QPoint((width() - size.width()) / 2, (height() - size.height()) / 2), size);
++		painter.setRenderHint(QPainter::SmoothPixmapTransform);
++		painter.drawImage(target, m_frame);
++	}
++	else
++	{
++		painter.setPen(Qt::white);
++		painter.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap, m_status);
++	}
++}
++
++void COnlineGuestWindow::keyPressEvent(QKeyEvent* event)
++{
++	if(event->key() == Qt::Key_F11 || (event->key() == Qt::Key_Escape && isFullScreen()))
++	{
++		isFullScreen() ? showNormal() : showFullScreen();
++		return;
++	}
++	if(!event->isAutoRepeat() && m_keyProvider) m_keyProvider->OnKeyPress(event->key());
++}
++
++void COnlineGuestWindow::keyReleaseEvent(QKeyEvent* event)
++{
++	if(!event->isAutoRepeat() && m_keyProvider) m_keyProvider->OnKeyRelease(event->key());
++}
+diff --git a/Source/ui_qt/onlineplay.h b/Source/ui_qt/onlineplay.h
+new file mode 100644
+index 0000000..4670edc
+--- /dev/null
++++ b/Source/ui_qt/onlineplay.h
+@@ -0,0 +1,154 @@
++#pragma once
++
++#include <QDialog>
++#include <QImage>
++#include <QTcpServer>
++#include <QTcpSocket>
++#include <QTimer>
++#include <QWidget>
++#include <condition_variable>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++
++#include "input/PH_GenericInput.h"
++#include "InputProviderQtKey.h"
++#include "sound/SoundHandler.h"
++
++class QComboBox;
++class QLabel;
++class QPushButton;
++class QSpinBox;
++
++namespace OnlineProto
++{
++	// Wire format (TCP): [u32 length LE][u8 type][payload], length = 1 + payload size.
++	enum MsgType : quint8
++	{
++		MSG_WELCOME = 1, // host -> guest: u8 guestSlot (255 = session full), u8 padIndex
++		MSG_FRAME = 2,   // host -> guest: JPEG image
++		MSG_INPUT = 3,   // guest -> host: u32 buttonMask LE (bit n = PS2 BUTTON n), u8 LX, LY, RX, RY
++		MSG_AUDIO = 4,   // host -> guest: u32 sampleRate LE, then interleaved stereo int16 samples
++	};
++
++	constexpr int MAX_GUESTS = 3; // host + 3 guests = 4 players
++	constexpr quint16 DEFAULT_PORT = 7777;
++
++	QByteArray Pack(MsgType, const QByteArray& payload);
++	// Calls handler(type, payload) for each complete message and removes them from buffer.
++	// Returns false if the stream is corrupt.
++	bool Unpack(QByteArray& buffer, const std::function<void(quint8, const QByteArray&)>& handler);
++}
++
++typedef std::function<CPH_GenericInput*()> PadHandlerGetter;
++
++class COnlineHost : public QObject
++{
++	Q_OBJECT
++public:
++	struct GuestInfo
++	{
++		bool connected = false;
++		QString address;
++		int pad = 0;
++	};
++
++	explicit COnlineHost(QObject* parent = nullptr);
++	~COnlineHost();
++
++	void SetPadHandlerGetter(PadHandlerGetter);
++	bool Start(quint16 port);
++	void Stop();
++	bool IsRunning() const;
++	QString ErrorString() const;
++	GuestInfo GetGuest(int slot) const;
++	void SetGuestPad(int slot, int pad);
++
++signals:
++	void guestsChanged();
++
++private slots:
++	void OnNewConnection();
++
++private:
++	struct Guest
++	{
++		QTcpSocket* socket = nullptr;
++		QByteArray rx;
++		quint32 buttons = 0;
++		quint8 axes[4] = {0x80, 0x80, 0x80, 0x80};
++		int pad = 0;
++	};
++
++	void OnGuestData(int slot, QTcpSocket*);
++	void OnGuestDisconnected(int slot, QTcpSocket*);
++	void SendWelcome(int slot);
++	void PushState();
++	void UpdateCapture();
++	void BroadcastFrame(const QByteArray&);
++	void BroadcastAudio(const QByteArray&);
++	void EncoderLoop();
++	int GuestCount() const;
++
++	QTcpServer m_server;
++	Guest m_guests[OnlineProto::MAX_GUESTS];
++	PadHandlerGetter m_padHandlerGetter;
++
++	std::thread m_encoderThread;
++	std::mutex m_encoderMutex;
++	std::condition_variable m_encoderCv;
++	QImage m_pendingImage;
++	bool m_encoderQuit = false;
++};
++
++class COnlineHostDialog : public QDialog
++{
++	Q_OBJECT
++public:
++	COnlineHostDialog(COnlineHost*, QWidget* parent);
++
++private slots:
++	void ToggleServer();
++	void Refresh();
++
++private:
++	COnlineHost* m_host = nullptr;
++	QSpinBox* m_port = nullptr;
++	QPushButton* m_toggle = nullptr;
++	QLabel* m_status = nullptr;
++	QLabel* m_addresses = nullptr;
++	QLabel* m_guestLabels[OnlineProto::MAX_GUESTS] = {};
++	QComboBox* m_guestPads[OnlineProto::MAX_GUESTS] = {};
++};
++
++class COnlineGuestWindow : public QWidget
++{
++	Q_OBJECT
++public:
++	COnlineGuestWindow(const QString& host, quint16 port, PadHandlerGetter, std::shared_ptr<CInputProviderQtKey>, QWidget* parent);
++
++protected:
++	void paintEvent(QPaintEvent*) override;
++	void keyPressEvent(QKeyEvent*) override;
++	void keyReleaseEvent(QKeyEvent*) override;
++
++private slots:
++	void OnReadyRead();
++	void OnDisconnected();
++	void SendInput();
++
++private:
++	QTcpSocket m_socket;
++	QByteArray m_rx;
++	QImage m_frame;
++	QString m_status;
++	QTimer m_inputTimer;
++	PadHandlerGetter m_padHandlerGetter;
++	std::shared_ptr<CInputProviderQtKey> m_keyProvider;
++	std::unique_ptr<CSoundHandler> m_sound;
++	QString m_host;
++	quint32 m_lastButtons = 0xFFFFFFFF;
++	quint8 m_lastAxes[4] = {};
++	bool m_welcomed = false;
++};
