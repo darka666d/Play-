@@ -250,10 +250,10 @@ index ce76ed4..5a2d95e 100644
  target_include_directories(Play PRIVATE
 diff --git a/Source/ui_qt/FrameShare.h b/Source/ui_qt/FrameShare.h
 new file mode 100644
-index 0000000..5cbfba6
+index 0000000..79f4319
 --- /dev/null
 +++ b/Source/ui_qt/FrameShare.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,61 @@
 +#pragma once
 +
 +#include <QImage>
@@ -290,12 +290,14 @@ index 0000000..5cbfba6
 +		m_handler = nullptr;
 +	}
 +
-+	// Called from the GS thread only. Caps capture at ~25 fps.
++	void SetIntervalMs(int ms) { m_intervalMs = ms; }
++
++	// Called from the GS thread only.
 +	bool ShouldCapture()
 +	{
 +		if(!m_enabled) return false;
 +		auto now = std::chrono::steady_clock::now();
-+		if(now - m_lastCapture < std::chrono::milliseconds(40)) return false;
++		if(now - m_lastCapture < std::chrono::milliseconds(m_intervalMs.load())) return false;
 +		m_lastCapture = now;
 +		return true;
 +	}
@@ -308,6 +310,7 @@ index 0000000..5cbfba6
 +
 +private:
 +	std::atomic<bool> m_enabled{false};
++	std::atomic<int> m_intervalMs{33};
 +	std::mutex m_mutex;
 +	Handler m_handler;
 +	std::chrono::steady_clock::time_point m_lastCapture;
@@ -510,10 +513,10 @@ index a2710e6..7fca0ea 100644
  	fs::path m_lastPath;
 diff --git a/Source/ui_qt/onlineplay.cpp b/Source/ui_qt/onlineplay.cpp
 new file mode 100644
-index 0000000..e68e349
+index 0000000..7a6cdea
 --- /dev/null
 +++ b/Source/ui_qt/onlineplay.cpp
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,636 @@
 +#include "onlineplay.h"
 +#include "FrameShare.h"
 +#include "AudioShare.h"
@@ -529,6 +532,8 @@ index 0000000..e68e349
 +#include <QHostAddress>
 +#include <QKeyEvent>
 +#include <QLabel>
++#include <QNetworkDatagram>
++#include <algorithm>
 +#include <QNetworkInterface>
 +#include <QPainter>
 +#include <QPushButton>
@@ -584,6 +589,7 @@ index 0000000..e68e349
 +    : QObject(parent)
 +{
 +	connect(&m_server, &QTcpServer::newConnection, this, &COnlineHost::OnNewConnection);
++	connect(&m_udp, &QUdpSocket::readyRead, this, &COnlineHost::OnUdpData);
 +}
 +
 +COnlineHost::~COnlineHost()
@@ -610,6 +616,11 @@ index 0000000..e68e349
 +{
 +	if(IsRunning()) return true;
 +	if(!m_server.listen(QHostAddress::AnyIPv4, port)) return false;
++	if(!m_udp.bind(QHostAddress::AnyIPv4, port))
++	{
++		m_server.close();
++		return false;
++	}
 +
 +	m_encoderQuit = false;
 +	m_encoderThread = std::thread([this] { EncoderLoop(); });
@@ -620,6 +631,7 @@ index 0000000..e68e349
 +void COnlineHost::Stop()
 +{
 +	m_server.close();
++	m_udp.close();
 +	for(auto& guest : m_guests)
 +	{
 +		if(guest.socket)
@@ -698,6 +710,7 @@ index 0000000..e68e349
 +			continue;
 +		}
 +		socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
++		socket->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 64 * 1024); // small kernel queue = low latency
 +		m_guests[slot] = Guest();
 +		m_guests[slot].socket = socket;
 +		connect(socket, &QTcpSocket::readyRead, this, [this, slot, socket] { OnGuestData(slot, socket); });
@@ -828,12 +841,50 @@ index 0000000..e68e349
 +			m_pendingImage = QImage();
 +		}
 +		image = image.mirrored(false, true); // GL read-back is bottom-up
-+		if(image.width() > 640) image = image.scaledToWidth(640, Qt::FastTransformation);
++		int maxWidth = m_maxWidth;
++		if(image.width() > maxWidth) image = image.scaledToWidth(maxWidth, Qt::FastTransformation);
 +		QByteArray jpeg;
 +		QBuffer buffer(&jpeg);
 +		buffer.open(QIODevice::WriteOnly);
-+		image.save(&buffer, "JPEG", 65);
++		image.save(&buffer, "JPEG", m_jpegQuality);
 +		QMetaObject::invokeMethod(this, [this, jpeg] { BroadcastFrame(jpeg); }, Qt::QueuedConnection);
++	}
++}
++
++void COnlineHost::SetQualityPreset(int preset)
++{
++	static const int widths[] = {448, 512, 640};
++	static const int qualities[] = {45, 55, 70};
++	static const int intervals[] = {33, 33, 40};
++	preset = std::max(0, std::min(preset, 2));
++	m_maxWidth = widths[preset];
++	m_jpegQuality = qualities[preset];
++	CFrameShare::GetInstance().SetIntervalMs(intervals[preset]);
++}
++
++// Guest input arrives over UDP: [u8 slot][u16 seq][u32 buttons][u8 LX, LY, RX, RY]
++void COnlineHost::OnUdpData()
++{
++	while(m_udp.hasPendingDatagrams())
++	{
++		auto datagram = m_udp.receiveDatagram();
++		const QByteArray data = datagram.data();
++		if(data.size() != 11) continue;
++		int slot = static_cast<quint8>(data[0]);
++		if(slot >= MAX_GUESTS) continue;
++		auto& guest = m_guests[slot];
++		if(!guest.socket) continue;
++		bool senderOk = false, peerOk = false;
++		quint32 sender = datagram.senderAddress().toIPv4Address(&senderOk);
++		quint32 peer = guest.socket->peerAddress().toIPv4Address(&peerOk);
++		if(!senderOk || !peerOk || sender != peer) continue; // only accept from the connected guest
++		quint16 seq = qFromLittleEndian<quint16>(data.constData() + 1);
++		if(guest.hasSeq && static_cast<qint16>(seq - guest.lastSeq) <= 0) continue; // old or duplicate
++		guest.hasSeq = true;
++		guest.lastSeq = seq;
++		guest.buttons = qFromLittleEndian<quint32>(data.constData() + 3);
++		memcpy(guest.axes, data.constData() + 7, 4);
++		PushState();
 +	}
 +}
 +
@@ -844,7 +895,7 @@ index 0000000..e68e349
 +	for(auto& guest : m_guests)
 +	{
 +		//Drop the frame for slow guests instead of building up latency
-+		if(guest.socket && guest.socket->bytesToWrite() < (1 << 20))
++		if(guest.socket && guest.socket->bytesToWrite() < 48 * 1024) // previous frame still in flight: skip this one
 +			guest.socket->write(message);
 +	}
 +}
@@ -869,6 +920,17 @@ index 0000000..e68e349
 +	m_toggle = new QPushButton(tr("Start hosting"), this);
 +	portRow->addWidget(m_toggle);
 +	layout->addLayout(portRow);
++
++	auto* qualityRow = new QHBoxLayout();
++	qualityRow->addWidget(new QLabel(tr("Stream quality:"), this));
++	m_quality = new QComboBox(this);
++	m_quality->addItems({tr("Low latency (recommended)"), tr("Balanced"), tr("High quality")});
++	qualityRow->addWidget(m_quality);
++	layout->addLayout(qualityRow);
++	connect(m_quality, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
++		m_host->SetQualityPreset(index);
++	});
++	m_host->SetQualityPreset(0);
 +
 +	m_status = new QLabel(this);
 +	layout->addWidget(m_status);
@@ -951,6 +1013,7 @@ index 0000000..e68e349
 +	setFocusPolicy(Qt::StrongFocus);
 +	resize(640, 480);
 +	setWindowTitle(tr("DigiForstep - Guest"));
++	m_port = port;
 +	m_status = tr("Connecting to %1:%2 ...").arg(host).arg(port);
 +
 +	connect(&m_socket, &QTcpSocket::readyRead, this, &COnlineGuestWindow::OnReadyRead);
@@ -996,6 +1059,7 @@ index 0000000..e68e349
 +				return;
 +			}
 +			m_welcomed = true;
++			m_slot = static_cast<quint8>(payload[0]);
 +			m_lastButtons = 0xFFFFFFFF; // force an input send
 +			setWindowTitle(tr("DigiForstep - Guest %1 (controlling pad %2) - %3")
 +			                   .arg(static_cast<quint8>(payload[0]) + 1)
@@ -1043,14 +1107,18 @@ index 0000000..e68e349
 +	quint32 buttons = 0;
 +	uint8 axes[4] = {};
 +	padHandler->GetLocalState(0, buttons, axes);
-+	if(buttons == m_lastButtons && memcmp(axes, m_lastAxes, 4) == 0) return;
++	bool changed = !(buttons == m_lastButtons && memcmp(axes, m_lastAxes, 4) == 0);
++	if(!changed && m_sendTimer.isValid() && m_sendTimer.elapsed() < 25) return; // resend state every 25ms (UDP can drop)
 +	m_lastButtons = buttons;
 +	memcpy(m_lastAxes, axes, 4);
++	m_sendTimer.restart();
 +
-+	QByteArray payload(8, 0);
-+	qToLittleEndian<quint32>(buttons, payload.data());
-+	memcpy(payload.data() + 4, axes, 4);
-+	m_socket.write(Pack(MSG_INPUT, payload));
++	QByteArray datagram(11, 0);
++	datagram[0] = static_cast<char>(m_slot);
++	qToLittleEndian<quint16>(++m_seq, datagram.data() + 1);
++	qToLittleEndian<quint32>(buttons, datagram.data() + 3);
++	memcpy(datagram.data() + 7, axes, 4);
++	m_udp.writeDatagram(datagram, m_socket.peerAddress(), m_port);
 +}
 +
 +void COnlineGuestWindow::paintEvent(QPaintEvent*)
@@ -1087,16 +1155,19 @@ index 0000000..e68e349
 +}
 diff --git a/Source/ui_qt/onlineplay.h b/Source/ui_qt/onlineplay.h
 new file mode 100644
-index 0000000..4670edc
+index 0000000..d091200
 --- /dev/null
 +++ b/Source/ui_qt/onlineplay.h
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,170 @@
 +#pragma once
 +
 +#include <QDialog>
 +#include <QImage>
 +#include <QTcpServer>
 +#include <QTcpSocket>
++#include <QUdpSocket>
++#include <QElapsedTimer>
++#include <atomic>
 +#include <QTimer>
 +#include <QWidget>
 +#include <condition_variable>
@@ -1157,6 +1228,7 @@ index 0000000..4670edc
 +	QString ErrorString() const;
 +	GuestInfo GetGuest(int slot) const;
 +	void SetGuestPad(int slot, int pad);
++	void SetQualityPreset(int preset); // 0 = low latency, 1 = balanced, 2 = high quality
 +
 +signals:
 +	void guestsChanged();
@@ -1172,6 +1244,8 @@ index 0000000..4670edc
 +		quint32 buttons = 0;
 +		quint8 axes[4] = {0x80, 0x80, 0x80, 0x80};
 +		int pad = 0;
++		quint16 lastSeq = 0;
++		bool hasSeq = false;
 +	};
 +
 +	void OnGuestData(int slot, QTcpSocket*);
@@ -1181,10 +1255,14 @@ index 0000000..4670edc
 +	void UpdateCapture();
 +	void BroadcastFrame(const QByteArray&);
 +	void BroadcastAudio(const QByteArray&);
++	void OnUdpData();
 +	void EncoderLoop();
 +	int GuestCount() const;
 +
 +	QTcpServer m_server;
++	QUdpSocket m_udp;
++	std::atomic<int> m_jpegQuality{45};
++	std::atomic<int> m_maxWidth{448};
 +	Guest m_guests[OnlineProto::MAX_GUESTS];
 +	PadHandlerGetter m_padHandlerGetter;
 +
@@ -1209,6 +1287,7 @@ index 0000000..4670edc
 +	COnlineHost* m_host = nullptr;
 +	QSpinBox* m_port = nullptr;
 +	QPushButton* m_toggle = nullptr;
++	QComboBox* m_quality = nullptr;
 +	QLabel* m_status = nullptr;
 +	QLabel* m_addresses = nullptr;
 +	QLabel* m_guestLabels[OnlineProto::MAX_GUESTS] = {};
@@ -1233,6 +1312,11 @@ index 0000000..4670edc
 +
 +private:
 +	QTcpSocket m_socket;
++	QUdpSocket m_udp;
++	QElapsedTimer m_sendTimer;
++	quint16 m_port = 0;
++	quint16 m_seq = 0;
++	quint8 m_slot = 0;
 +	QByteArray m_rx;
 +	QImage m_frame;
 +	QString m_status;
