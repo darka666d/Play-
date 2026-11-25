@@ -124,12 +124,13 @@ index 64d9c6a..7865098 100644
  };
 diff --git a/Source/ui_qt/AudioShare.h b/Source/ui_qt/AudioShare.h
 new file mode 100644
-index 0000000..2360971
+index 0000000..870c0e7
 --- /dev/null
 +++ b/Source/ui_qt/AudioShare.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,87 @@
 +#pragma once
 +
++#include <exception>
 +#include <functional>
 +#include <memory>
 +#include <mutex>
@@ -183,17 +184,32 @@ index 0000000..2360971
 +	static FactoryFunction Wrap(FactoryFunction innerFactory)
 +	{
 +		return [innerFactory]() -> CSoundHandler* {
-+			return new CSH_AudioTap(std::unique_ptr<CSoundHandler>(innerFactory()));
++			//No audio device (e.g. a VPS): keep going with a silent sink so guests still get the audio.
++			std::unique_ptr<CSoundHandler> inner;
++			try
++			{
++				inner.reset(innerFactory());
++			}
++			catch(const std::exception&)
++			{
++			}
++			return new CSH_AudioTap(std::move(inner));
 +		};
 +	}
 +
-+	void Reset() override { m_inner->Reset(); }
-+	bool HasFreeBuffers() override { return m_inner->HasFreeBuffers(); }
-+	void RecycleBuffers() override { m_inner->RecycleBuffers(); }
++	void Reset() override
++	{
++		if(m_inner) m_inner->Reset();
++	}
++	bool HasFreeBuffers() override { return m_inner ? m_inner->HasFreeBuffers() : true; }
++	void RecycleBuffers() override
++	{
++		if(m_inner) m_inner->RecycleBuffers();
++	}
 +	void Write(int16* samples, unsigned int count, unsigned int rate) override
 +	{
 +		CAudioShare::GetInstance().Submit(samples, count, rate);
-+		m_inner->Write(samples, count, rate);
++		if(m_inner) m_inner->Write(samples, count, rate);
 +	}
 +
 +private:
